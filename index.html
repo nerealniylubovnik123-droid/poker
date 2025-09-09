@@ -168,7 +168,7 @@
         const canShare = (stage !== "preflop") && hero.length >= needHero;
         const payload = { game, stage, hero, board, opponents };
         if (canShare) {
-          tg.MainButton.setText("Отправить боту");
+          
           const handler = () => {
             try {
               tg.sendData(JSON.stringify(payload)); // bot will receive web_app_data
