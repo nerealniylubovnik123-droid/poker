@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Покер — мини‑приложение (One‑File, Secure Bot Link)</title>
+  <!-- Tailwind (CDN) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    html, body { height: 100%; background: #f8fafc; }
+    #root { max-width: 420px; margin: 0 auto; }
+    .noselect { -webkit-user-select:none; -moz-user-select:none; user-select:none; }
+  </style>
+  <!-- React 18 (UMD) -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Telegram WebApp SDK (no token on client) -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="module">
+    // Telegram bootstrap — SAFE: no bot token here
+    const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+    if (tg) {
+      tg.ready();
+      tg.expand();
+      document.documentElement.classList.toggle('dark', tg.colorScheme === 'dark');
+      tg.BackButton.show();
+      tg.BackButton.onClick(() => tg.close());
+    }
+
+    // ====== pokersolver (ESM) ======
+    const PokerSolverNS = await import('https://cdn.jsdelivr.net/npm/pokersolver/+esm');
+    const Hand = (PokerSolverNS && (PokerSolverNS.Hand || (PokerSolverNS.default && PokerSolverNS.default.Hand))) || null;
+
+    const { useState, useMemo, useEffect } = window.React;
+
+    // ========= Card & helpers =========
+    const SUITS = ["s", "h", "d", "c"];
+    const RANKS = ["A", "K", "Q", "J", "T", "9", "8", "7", "6", "5", "4", "3", "2"];
+
+    function makeDeck() { const deck = []; for (const r of RANKS) for (const s of SUITS) deck.push(r + s); return deck; }
+    function cardLabel(cs) { const r = cs[0]; const s = cs[1]; const suitMap = { s: "♠", h: "♥", d: "♦", c: "♣" }; const cls = (s === "h" || s === "d") ? "text-red-600" : ""; return window.React.createElement("span", { className: cls }, r, suitMap[s]); }
+    function removeCards(deck, used) { const usedSet = new Set(used); return deck.filter((c) => !usedSet.has(c)); }
+    function shuffle(arr) { const a = arr.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+
+    // ========= Poker logic =========
+    const HAND_ORDER = ["Старшая карта","Пара","Две пары","Сет","Стрит","Флеш","Фул-хаус","Каре","Стрит-флеш"];
+    function emptyHandDist() { const d = {}; HAND_ORDER.forEach((k) => d[k] = 0); return d; }
+    function winners(list) { if (!Hand) return []; try { return Hand.winners(list); } catch { return []; } }
+    function solveHand(cards, game) { if (!Hand) return null; try { if (game === "omaha") return Hand.solve(cards, "omaha"); return Hand.solve(cards); } catch { return null; } }
+    function handTypeNameRu(h) {
+      if (!h) return "Старшая карта";
+      const raw = (h.name || h.descr || (h.toString ? h.toString() : "")).toLowerCase();
+      const mapping = [["straight flush","Стрит-флеш"],["four of a kind","Каре"],["full house","Фул-хаус"],["flush","Флеш"],["straight","Стрит"],["three of a kind","Сет"],["two pair","Две пары"],["pair","Пара"]];
+      for (const [key,label] of mapping) if (raw.includes(key)) return label;
+      return "Старшая карта";
+    }
+
+    // Monte Carlo vs N opps; exact board rollout when <=1 unknown board card
+    function simEquity({ game, hero, board, opponents = 1, iters = 2000 }) {
+      const deck = makeDeck();
+      const used = [...hero, ...board];
+      const baseDeck = removeCards(deck, used);
+      const takePerVillain = game === "omaha" ? 4 : 2;
+      let wins = 0, ties = 0;
+      const dist = emptyHandDist();
+      const need = 5 - board.length;
+
+      function dealVillains(d) {
+        const hands = []; let pool = d;
+        for (let v = 0; v < opponents; v++) { hands.push(pool.slice(0, takePerVillain)); pool = pool.slice(takePerVillain); }
+        return { hands, rest: pool };
+      }
+
+      if (need <= 1) {
+        const remaining = baseDeck.slice();
+        const boardVariants = need === 0 ? [board] : remaining.map((c) => [...board, c]);
+        for (const b of boardVariants) {
+          const reps = Math.max(1, Math.floor(iters / Math.max(1, boardVariants.length)));
+          for (let t = 0; t < reps; t++) {
+            let d = shuffle(removeCards(baseDeck, b.slice(board.length)));
+            const { hands: vHands } = dealVillains(d);
+            const heroSolved = solveHand([...hero, ...b], game); if (!heroSolved) continue;
+            const villSolved = vHands.map((vh) => solveHand([...vh, ...b], game)).filter(Boolean);
+            const all = [heroSolved, ...villSolved]; const ws = winners(all); if (ws.length === 0) continue;
+            if (ws.includes(heroSolved)) { if (ws.length > 1) ties++; else wins++; }
+            const key = handTypeNameRu(heroSolved); dist[key] = (dist[key] || 0) + 1;
+          }
+        }
+      } else {
+        for (let t = 0; t < iters; t++) {
+          let d = shuffle(baseDeck);
+          const { hands: vHands, rest } = dealVillains(d);
+          const add = 5 - board.length; const simBoard = board.concat(rest.slice(0, add));
+          const heroSolved = solveHand([...hero, ...simBoard], game); if (!heroSolved) continue;
+          const villSolved = vHands.map((vh) => solveHand([...vh, ...simBoard], game)).filter(Boolean);
+          const all = [heroSolved, ...villSolved]; const ws = winners(all); if (ws.length === 0) continue;
+          if (ws.includes(heroSolved)) { if (ws.length > 1) ties++; else wins++; }
+          const key = handTypeNameRu(heroSolved); dist[key] = (dist[key] || 0) + 1;
+        }
+      }
+
+      const total = Object.values(dist).reduce((a, b) => a + b, 0) || 1;
+      const equity = (wins + ties * 0.5) / total;
+      const probs = Object.fromEntries(HAND_ORDER.map((k) => [k, (dist[k] || 0) / total]));
+      return { equity, tie: ties / total, probs };
+    }
+
+    function currentBest({ game, hero, board }) { if (board.length + hero.length < 5) return null; return solveHand([...hero, ...board], game); }
+    function computeOuts({ game, hero, board }) {
+      const needsCard = board.length === 3 || board.length === 4; if (!needsCard) return { outs: 0, pct: 0 };
+      const deck = makeDeck(); const used = new Set([...hero, ...board]); const remaining = deck.filter((c) => !used.has(c));
+      const baseSolved = currentBest({ game, hero, board }); const baseRank = baseSolved ? baseSolved.rank : -Infinity;
+      let outs = 0; for (const c of remaining) { const solved = solveHand([...hero, ...board, c], game); if (solved && solved.rank > baseRank) outs++; }
+      const pct = remaining.length ? outs / remaining.length : 0; return { outs, pct };
+    }
+
+    const STREET_FLOW = ["preflop","flop","turn","river"];
+    function nextStageOf(stage) { const idx = STREET_FLOW.indexOf(stage); if (idx === -1 || idx === STREET_FLOW.length - 1) return stage; return STREET_FLOW[idx + 1]; }
+    function heroCountForGame(game) { return game === "omaha" ? 4 : 2; }
+
+    function Pill({ children }) { return window.React.createElement("span",{className:"px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 text-xs font-medium"},children); }
+    function CardPicker({ disabled, taken, currentCount, limit, onPick, title }) {
+      const deck = makeDeck(); const takenSet = new Set(taken); const canPick = (c) => !takenSet.has(c) && currentCount < limit && !disabled;
+      return window.React.createElement("div",{className:"space-y-1"},
+        title?window.React.createElement("div",{className:"text-xs text-slate-500"},title):null,
+        window.React.createElement("div",{className:"grid grid-cols-8 gap-1"},
+          ...deck.map((c)=> window.React.createElement("button",{
+            key:c,onClick:()=> (canPick(c)? onPick(c): null),disabled:!!disabled||takenSet.has(c)||currentCount>=limit,
+            className: "noselect border rounded py-0.5 text-center text-xs " + (takenSet.has(c) ? "opacity-30 cursor-not-allowed" : currentCount < limit && !disabled ? "bg-white" : "bg-gray-50")
+          }, cardLabel(c)))
+        )
+      );
+    }
+
+    function App() {
+      const [view,setView]=useState("home");
+      const [game,setGame]=useState("holdem");
+      const [stage,setStage]=useState("preflop");
+      const [hero,setHero]=useState([]);
+      const [board,setBoard]=useState([]);
+      const [opponents,setOpponents]=useState(1);
+      const [mode,setMode]=useState("accurate");
+      const simIters = mode==="fast"?800:4000;
+      const needHero = heroCountForGame(game);
+
+      const equityData = useMemo(()=>{
+        if(stage==="preflop") return null;
+        if(hero.length<needHero) return null;
+        return simEquity({ game, hero, board, opponents, iters: simIters });
+      }, [game, hero, board, needHero, stage, opponents, mode]);
+
+      const bestNow = useMemo(()=> stage==="preflop"? null : currentBest({ game, hero, board }), [game, hero, board, stage]);
+      const outsNow = useMemo(()=> stage==="preflop"? {outs:0,pct:0} : computeOuts({ game, hero, board }), [game, hero, board, stage]);
+
+      function resetHand(keepView=true){ setHero([]); setBoard([]); setStage("preflop"); if(!keepView) setView("home"); }
+      function onPickHero(c){ if(hero.includes(c)||hero.length>=needHero) return; setHero([...hero,c]); }
+      function onPickBoard(c){ if(board.includes(c)) return; const limit = stage==="flop"?3: stage==="turn"?4: 5; if(board.length>=limit) return; setBoard([...board,c]); }
+      function nextStreet(){ setStage((s)=> nextStageOf(s)); }
+      const equityPct = equityData ? (equityData.equity*100).toFixed(1) + "%" : "—";
+
+      // Telegram MainButton — send data to the bot securely via tg.sendData (handled by bot backend)
+      useEffect(() => {
+        if (!tg) return;
+        const canShare = (stage !== "preflop") && hero.length >= needHero;
+        const payload = { game, stage, hero, board, opponents };
+        if (canShare) {
+          tg.MainButton.setText("Отправить боту");
+          const handler = () => {
+            try {
+              tg.sendData(JSON.stringify(payload)); // bot will receive web_app_data
+              tg.showAlert("Данные отправлены боту");
+            } catch (e) {
+              tg.showAlert("Не удалось отправить данные");
+            }
+          };
+          tg.MainButton.onClick(handler);
+          tg.MainButton.show();
+          return () => { tg.MainButton.offClick(handler); tg.MainButton.hide(); };
+        } else {
+          tg.MainButton.hide();
+        }
+      }, [tg, stage, hero, board, opponents, needHero]);
+
+      // HOME
+      if(view==="home"){
+        return window.React.createElement("div",{className:"w-full min-h-screen bg-slate-50 p-4"},
+          window.React.createElement("div",{className:"max-w-sm mx-auto mt-10 space-y-4 text-center"},
+            window.React.createElement("h1",{className:"text-2xl font-bold"},"Выберите покер"),
+            window.React.createElement("p",{className:"text-slate-600 text-sm"},"Первая страница: выберите тип игры"),
+            window.React.createElement("div",{className:"grid grid-cols-1 gap-3"},
+              window.React.createElement("button",{className:"p-4 rounded-xl border bg-white shadow text-lg", onClick:()=>{ setGame("holdem"); resetHand(true); setView("table"); }},"Холдем (2 карты)"),
+              window.React.createElement("button",{className:"p-4 rounded-xl border bg-white shadow text-lg", onClick:()=>{ setGame("omaha"); resetHand(true); setView("table"); }},"Омаха (4 карты)")
+            )
+          )
+        );
+      }
+
+      // TABLE
+      return window.React.createElement("div",{className:"w-full min-h-screen bg-slate-50 p-2"},
+        window.React.createElement("div",{className:"space-y-3 max-w-sm mx-auto"},
+          window.React.createElement("div",{className:"flex items-center justify-between"},
+            window.React.createElement("button",{className:"text-xs underline", onClick:()=> resetHand(false)},"← Назад"),
+            window.React.createElement("div",{className:"text-xs text-slate-600"},"Игра: ", game==="holdem"?"Холдем":"Омаха")
+          ),
+          window.React.createElement("div",{className:"bg-white rounded-lg shadow p-2 flex items-center justify-between gap-2 text-xs"},
+            window.React.createElement("div",{className:"flex items-center gap-2"},
+              window.React.createElement("span", null, "Оппонентов:"),
+              window.React.createElement("select",{className:"border rounded px-2 py-1", value:opponents, onChange:(e)=> setOpponents(Math.max(1, Math.min(9, Number(e.target.value))))},
+                ...Array.from({length:9}, (_,i)=>i+1).map((n)=> window.React.createElement("option",{ key:n, value:n }, n))
+              )
+            ),
+            window.React.createElement("div",{className:"flex items-center gap-1"},
+              window.React.createElement("button",{className:"px-2 py-1 rounded border " + (mode==="fast"?"bg-slate-800 text-white":"bg-white"), onClick:()=> setMode("fast")},"Быстро"),
+              window.React.createElement("button",{className:"px-2 py-1 rounded border " + (mode==="accurate"?"bg-slate-800 text-white":"bg-white"), onClick:()=> setMode("accurate")},"Точно")
+            )
+          ),
+          (stage==="preflop"
+            ? (hero.length>0
+                ? window.React.createElement("div",{className:"bg-white rounded-lg shadow p-3 text-center"},
+                    window.React.createElement("div",{className:"text-xs text-slate-500 mb-2"},"Ваши карманные"),
+                    window.React.createElement("div",{className:"flex items-center justify-center gap-2 text-lg"},
+                      ...hero.map((c)=> window.React.createElement("div",{key:c, className:"px-2 py-1 rounded border"}, cardLabel(c)))
+                    )
+                  )
+                : null
+              )
+            : window.React.createElement("div",{className:"bg-white rounded-lg shadow p-2 space-y-1 text-center"},
+                window.React.createElement(Pill,null,"Комбинация: ", bestNow ? handTypeNameRu(bestNow) : "—"),
+                window.React.createElement(Pill,null,"Эквити: ", equityPct),
+                (stage!=="river") && window.React.createElement(Pill,null,"Ауты: ", outsNow.outs, " (", (outsNow.pct*100).toFixed(1), "%)"),
+                window.React.createElement("div",{className:"grid grid-cols-2 gap-1 text-xs mt-1"},
+                  ...HAND_ORDER.map((k)=> window.React.createElement("div",{key:k, className:"flex items-center justify-between border rounded px-2 py-1"},
+                    window.React.createElement("span", null, k),
+                    window.React.createElement("span",{className:"font-semibold"}, equityData ? ((equityData.probs[k]*100).toFixed(1) + "%") : "—")
+                  ))
+                )
+              )
+          ),
+          (hero.length < needHero) && window.React.createElement(CardPicker, { title:`Карманные карты (${hero.length}/${needHero})`, disabled:false, taken:[...hero, ...board], currentCount:hero.length, limit:needHero, onPick:onPickHero }),
+          (stage!=="preflop" && hero.length>=needHero) && window.React.createElement(CardPicker, {
+            title: stage==="flop" ? "Выберите флоп (3 карты)" : stage==="turn" ? "Выберите тёрн (1 карта)" : stage==="river" ? "Выберите ривер (1 карта)" : "Борд выбран",
+            disabled: (stage==="flop" && board.length>=3) || (stage==="turn" && board.length>=4) || (stage==="river" && board.length>=5),
+            taken:[...hero, ...board], currentCount:board.length, limit: stage==="flop" ? 3 : stage==="turn" ? 4 : stage==="river" ? 5 : 0, onPick:onPickBoard
+          }),
+          window.React.createElement("div",{className:"flex gap-2 justify-center"},
+            window.React.createElement("button",{className:"px-3 py-1 rounded border text-xs", onClick:()=> resetHand(true)},"Fold"),
+            (stage==="preflop" && hero.length>=needHero) && window.React.createElement("button",{className:"px-3 py-1 rounded border bg-emerald-600 text-white text-xs", onClick:nextStreet},"Флоп"),
+            (stage==="flop" && board.length>=3) && window.React.createElement("button",{className:"px-3 py-1 rounded border bg-emerald-600 text-white text-xs", onClick:nextStreet},"Тёрн"),
+            (stage==="turn" && board.length>=4) && window.React.createElement("button",{className:"px-3 py-1 rounded border bg-emerald-600 text-white text-xs", onClick:nextStreet},"Ривер")
+          )
+        )
+      );
+    }
+
+    const root = window.ReactDOM.createRoot(document.getElementById("root"));
+    root.render(window.React.createElement(App));
+  </script>
+</body>
+</html>
