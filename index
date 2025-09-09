@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>Покер — мини‑приложение (One‑File)</title>
+  <title>Покер — мини‑приложение (One‑File, Secure Bot Link)</title>
   <!-- Tailwind (CDN) -->
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
@@ -14,19 +14,21 @@
   <!-- React 18 (UMD) -->
   <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-  <!-- Telegram WebApp SDK (optional; safe: no token here) -->
+  <!-- Telegram WebApp SDK (no token on client) -->
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
 </head>
 <body>
   <div id="root"></div>
 
   <script type="module">
-    // Telegram bootstrap (token never on client)
+    // Telegram bootstrap — SAFE: no bot token here
     const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
     if (tg) {
       tg.ready();
       tg.expand();
       document.documentElement.classList.toggle('dark', tg.colorScheme === 'dark');
+      tg.BackButton.show();
+      tg.BackButton.onClick(() => tg.close());
     }
 
     // ====== pokersolver (ESM) ======
@@ -159,6 +161,29 @@
       function onPickBoard(c){ if(board.includes(c)) return; const limit = stage==="flop"?3: stage==="turn"?4: 5; if(board.length>=limit) return; setBoard([...board,c]); }
       function nextStreet(){ setStage((s)=> nextStageOf(s)); }
       const equityPct = equityData ? (equityData.equity*100).toFixed(1) + "%" : "—";
+
+      // Telegram MainButton — send data to the bot securely via tg.sendData (handled by bot backend)
+      useEffect(() => {
+        if (!tg) return;
+        const canShare = (stage !== "preflop") && hero.length >= needHero;
+        const payload = { game, stage, hero, board, opponents };
+        if (canShare) {
+          tg.MainButton.setText("Отправить боту");
+          const handler = () => {
+            try {
+              tg.sendData(JSON.stringify(payload)); // bot will receive web_app_data
+              tg.showAlert("Данные отправлены боту");
+            } catch (e) {
+              tg.showAlert("Не удалось отправить данные");
+            }
+          };
+          tg.MainButton.onClick(handler);
+          tg.MainButton.show();
+          return () => { tg.MainButton.offClick(handler); tg.MainButton.hide(); };
+        } else {
+          tg.MainButton.hide();
+        }
+      }, [tg, stage, hero, board, opponents, needHero]);
 
       // HOME
       if(view==="home"){
