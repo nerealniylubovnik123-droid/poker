@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Покер WebApp — позиции, эквити, риверы</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    html, body { height: 100%; background: #0b1220; }
+    #root { max-width: 420px; margin: 0 auto; }
+    .noselect { -webkit-user-select:none; -moz-user-select:none; user-select:none; }
+  </style>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body class="text-slate-100">
+  <div id="root"></div>
+
+  <script type="module">
+    const tg = window.Telegram?.WebApp;
+    if (tg) {
+      tg.ready();
+      tg.expand();
+      document.documentElement.classList.toggle('dark', tg.colorScheme === 'dark');
+    }
+
+    const PokerSolverNS = await import('https://cdn.jsdelivr.net/npm/pokersolver/+esm');
+    const Hand = (PokerSolverNS && (PokerSolverNS.Hand || (PokerSolverNS.default && PokerSolverNS.default.Hand))) || null;
+
+    const { useState, useMemo } = React;
+
+    const SUITS = ["s","h","d","c"];
+    const RANKS = ["A","K","Q","J","T","9","8","7","6","5","4","3","2"];
+    const RANK_VAL = Object.fromEntries(RANKS.map((r,i)=>[r,14-i]));
+
+    function makeDeck(){ const d=[]; for(const r of RANKS) for(const s of SUITS) d.push(r+s); return d; }
+    function cardLabel(cs){ const r=cs[0], s=cs[1]; const suit={s:"♠",h:"♥",d:"♦",c:"♣"}; const cls=(s==="h"||s==="d")?"text-rose-400":""; return React.createElement("span",{className:cls}, r, suit[s]); }
+    function removeCards(deck, used){ const set=new Set(used); return deck.filter(c=>!set.has(c)); }
+    function shuffle(a){ const arr=a.slice(); for(let i=arr.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [arr[i],arr[j]]=[arr[j],arr[i]];} return arr; }
+
+    const POSITIONS=[
+      {key:"BTN",label:"Дилер (BTN)",tight:0.55},
+      {key:"CO",label:"Cutoff (CO)",tight:0.48},
+      {key:"MP",label:"Middle (MP)",tight:0.40},
+      {key:"UTG",label:"Ранняя (UTG)",tight:0.32},
+      {key:"SB",label:"Малый блайнд (SB)",tight:0.50},
+      {key:"BB",label:"Большой блайнд (BB)",tight:0.58},
+    ];
+    function scoreHoldem2(c1,c2){
+      const r1=RANK_VAL[c1[0]], r2=RANK_VAL[c2[0]]; const suited=c1[1]===c2[1];
+      const pair=c1[0]===c2[0]; const gap=Math.abs(r1-r2); const hi=(r1>=13)+(r2>=13);
+      const base=Math.max(r1,r2)+Math.min(r1,r2)*0.6; return base+(pair?6:0)+(suited?2:0)-gap*0.6+hi*1.5;
+    }
+    function scoreOmaha4(cs){ let ranks=cs.map(c=>RANK_VAL[c[0]]).sort((a,b)=>b-a); let base=ranks[0]*1.0+ranks[1]*0.8+ranks[2]*0.5+ranks[3]*0.3;
+      const suits=cs.map(c=>c[1]); const suitCounts=Object.values(suits.reduce((m,s)=>(m[s]=(m[s]||0)+1,m),{})); base+=suitCounts.filter(n=>n>=2).length*1.8;
+      ranks.sort((a,b)=>a-b); let gaps=0; for(let i=1;i<ranks.length;i++) gaps+=Math.max(0,ranks[i]-ranks[i-1]-1); base-=gaps*0.2;
+      const counts=cs.reduce((m,c)=>(m[c[0]]=(m[c[0]]||0)+1,m),{}); if((counts.A||0)>=2) base+=3; if((counts.K||0)>=2) base+=1.5; return base; }
+    function acceptByPosition(game,cards,posKey){ const pos=POSITIONS.find(p=>p.key===posKey)||POSITIONS[0]; const tight=pos.tight; const s=game==="omaha"?scoreOmaha4(cards):scoreHoldem2(cards[0],cards[1]); const z=1/(1+Math.exp(-(s-14)/2.5)); return Math.random()<(z*tight); }
+    function sampleOpponentHands({game,deck,opponents,posKey}){ const hands=[]; const pool=deck.slice(); function draw(n){const p=[]; for(let i=0;i<n;i++){ const idx=Math.floor(Math.random()*(pool.length)); p.push(pool.splice(idx,1)[0]); } return p;} for(let v=0;v<opponents;v++){ if(game==="omaha"){ let tries=0, ok=null; while(tries<200){ const sample=draw(4); if(acceptByPosition("omaha",sample,posKey)){ ok=sample; break;} pool.push(...sample); tries++; } if(!ok) ok=draw(4); hands.push(ok);} else { let tries=0, ok=null; while(tries<200){ const sample=draw(2); if(acceptByPosition("holdem",sample,posKey)){ ok=sample; break;} pool.push(...sample); tries++; } if(!ok) ok=draw(2); hands.push(ok);} } return hands; }
+
+    const HAND_ORDER=["Старшая карта","Пара","Две пары","Сет","Стрит","Флеш","Фул-хаус","Каре","Стрит-флеш"];
+    function emptyHandDist(){ const d={}; HAND_ORDER.forEach(k=>d[k]=0); return d; }
+    function winners(list){ if(!Hand) return []; try { return Hand.winners(list); } catch { return []; } }
+    function solveHand(cards,game){ if(!Hand) return null; try { return game==="omaha"?Hand.solve(cards,"omaha"):Hand.solve(cards);} catch { return null; } }
+    function handTypeNameRu(h){ if(!h) return "Старшая карта"; const raw=(h.name||h.descr||(h.toString?h.toString():"")).toLowerCase(); const map=[["straight flush","Стрит-флеш"],["four of a kind","Каре"],["full house","Фул-хаус"],["flush","Флеш"],["straight","Стрит"],["three of a kind","Сет"],["two pair","Две пары"],["pair","Пара"]]; for(const [k,v] of map) if(raw.includes(k)) return v; return "Старшая карта"; }
+
+    function simEquity({game,hero,board,opponents=1,iters=2000,posKey="BTN"}){
+      const baseDeck=removeCards(makeDeck(),[...hero,...board]); const need=5-board.length; let wins=0,ties=0; const dist=emptyHandDist();
+      function trialOnce(bord){ const pool=shuffle(baseDeck); const filtered=removeCards(pool,bord.filter(c=>!board.includes(c))); const vHands=sampleOpponentHands({game,deck:filtered,opponents,posKey}); const heroSolved=solveHand([...hero,...bord],game); const villSolved=vHands.map(v=>solveHand([...v,...bord],game)).filter(Boolean); const all=[heroSolved,...villSolved]; const ws=winners(all); if(!ws||ws.length===0) return; if(ws.includes(heroSolved)){ if(ws.length>1) ties++; else wins++; } const key=handTypeNameRu(heroSolved); dist[key]=(dist[key]||0)+1; }
+      if(need<=1){ const rem=baseDeck.slice(); const variants=need===0?[board]:rem.map(c=>[...board,c]); const reps=Math.max(1,Math.floor(iters/variants.length)); for(const b of variants){ for(let t=0;t<reps;t++) trialOnce(b);} } else { for(let t=0;t<iters;t++){ const pool=shuffle(baseDeck); const add=5-board.length; const extra=pool.slice(0,add); trialOnce(board.concat(extra)); } }
+      const total=Object.values(dist).reduce((a,b)=>a+b,0)||1; const equity=(wins+0.5*ties)/total; const probs=Object.fromEntries(HAND_ORDER.map(k=>[k,(dist[k]||0)/total])); return {equity,tie:ties/total,probs};
+    }
+    function currentBest({game,hero,board}){ if(board.length+hero.length<5) return null; return solveHand([...hero,...board],game); }
+    function computeOuts({game,hero,board}){ const needsCard=board.length===3||board.length===4; if(!needsCard) return {outs:0,pct:0}; const deck=makeDeck(); const used=new Set([...hero,...board]); const remaining=deck.filter(c=>!used.has(c)); const baseSolved=currentBest({game,hero,board}); const baseRank=baseSolved?baseSolved.rank:-Infinity; let outs=0; for(const c of remaining){ const solved=solveHand([...hero,...board,c],game); if(solved && solved.rank>baseRank) outs++; } const pct=remaining.length?outs/remaining.length:0; return {outs,pct}; }
+
+    function computeOutsByTypeNextCard({game,hero,board}){
+      const map = Object.fromEntries(HAND_ORDER.map(k=>[k,0]));
+      const needsCard = board.length===3 || board.length===4;
+      if(!needsCard) return { map };
+      const deck=makeDeck(); const used=new Set([...hero,...board]); const remaining=deck.filter(c=>!used.has(c));
+      for(const c of remaining){ const solved=solveHand([...hero,...board,c],game); const t=handTypeNameRu(solved); map[t]=(map[t]||0)+1; }
+      return { map };
+    }
+
+    function riverProbPercent(hero,board){ const used=[...hero,...board]; const N=52-used.length; return (100/N); }
+    function analyzeVsRangeAtRiver({game,hero,board,opponents=1,iters=1500,posKey="BTN"}){ const deck=removeCards(makeDeck(),[...hero,...board]); const total=iters; const lose={}, win={}; const heroSolved=solveHand([...hero,...board],game); if(!heroSolved) return {lose:{},win:{},total:0}; for(let t=0;t<iters;t++){ const vHands=sampleOpponentHands({game,deck:shuffle(deck),opponents,posKey}); const villSolved=vHands.map(v=>solveHand([...v,...board],game)).filter(Boolean); if(villSolved.length===0) continue; let bestVill=villSolved[0]; for(let i=1;i<villSolved.length;i++){ if(villSolved[i].rank>bestVill.rank) bestVill=villSolved[i]; } const ws=winners([heroSolved,bestVill]); const vType=handTypeNameRu(bestVill); if(!ws||ws.length===0) continue; if(ws.length===2) { /* tie */ } else if(ws[0]===heroSolved){ win[vType]=(win[vType]||0)+1; } else { lose[vType]=(lose[vType]||0)+1; } } return {lose,win,total}; }
+
+    const STREET_FLOW=["preflop","flop","turn","river"];
+    function nextStageOf(s){ const i=STREET_FLOW.indexOf(s); return (i<0||i===STREET_FLOW.length-1)? s : STREET_FLOW[i+1]; }
+    function heroCountForGame(g){ return g==="omaha"?4:2; }
+
+    function Pill({children}){ return React.createElement("span",{className:"px-2 py-0.5 rounded-full bg-slate-800 text-slate-200 text-xs font-medium"},children); }
+    function CardPicker({disabled,taken,currentCount,limit,onPick,title}){ const deck=makeDeck(); const takenSet=new Set(taken); const canPick=c=>!takenSet.has(c)&&currentCount<limit&&!disabled; return React.createElement("div",{className:"space-y-1"}, title?React.createElement("div",{className:"text-xs text-slate-400"},title):null, React.createElement("div",{className:"grid grid-cols-8 gap-1"}, ...deck.map(c=>React.createElement("button",{key:c,onClick:()=>canPick(c)?onPick(c):null,disabled:!!disabled||takenSet.has(c)||currentCount>=limit,className:"noselect border border-slate-700 rounded py-0.5 text-center text-xs "+(takenSet.has(c)?"opacity-30 cursor-not-allowed":currentCount<limit&&!disabled?"bg-slate-900":"bg-slate-800")}, cardLabel(c)))) ); }
+    function GridCards({title,cards}){ return React.createElement("div",{className:"bg-slate-900 rounded-lg shadow p-2"}, title?React.createElement("div",{className:"text-xs text-slate-400 mb-2"},title):null, React.createElement("div",{className:"flex flex-wrap gap-2 text-lg"}, ...cards.map(c=>React.createElement("div",{key:c,className:"px-2 py-1 rounded border border-slate-700 bg-slate-800"},cardLabel(c)))) ); }
+
+    function App(){
+      const [view,setView]=useState("home");
+      const [game,setGame]=useState("holdem");
+      const [stage,setStage]=useState("preflop");
+      const [hero,setHero]=useState([]);
+      const [board,setBoard]=useState([]);
+      const [opponents,setOpponents]=useState(1);
+      const [mode,setMode]=useState("accurate");
+      const [showPicker,setShowPicker]=useState(true);
+      const [posKey,setPosKey]=useState("BTN");
+      const [badRivers,setBadRivers]=useState(null);
+      const [goodRivers,setGoodRivers]=useState(null);
+      const [riverComb,setRiverComb]=useState(null);
+
+      const simIters = mode==="fast" ? 600 : 2400;
+      const needHero = heroCountForGame(game);
+
+      const equityData = useMemo(()=>{ if(stage==="preflop") return null; if(hero.length<needHero) return null; return simEquity({game,hero,board,opponents,iters:simIters,posKey}); }, [game,hero,board,needHero,stage,opponents,mode,posKey]);
+      const bestNow = useMemo(()=> stage==="preflop"?null:currentBest({game,hero,board}), [game,hero,board,stage]);
+      const outsNow = useMemo(()=> stage==="preflop"?{outs:0,pct:0}:computeOuts({game,hero,board}), [game,hero,board,stage]);
+      const outsByType = useMemo(()=> computeOutsByTypeNextCard({game,hero,board}), [game,hero,board]);
+
+      function resetHand(){ setHero([]); setBoard([]); setStage("preflop"); setShowPicker(true); setBadRivers(null); setGoodRivers(null); setRiverComb(null); }
+      function onPickHero(c){ if(hero.includes(c)||hero.length>=needHero) return; const next=[...hero,c]; setHero(next); if(next.length>=needHero) setShowPicker(false); }
+      function onPickBoard(c){ if(board.includes(c)) return; const limit=stage==="flop"?3:stage==="turn"?4:5; const next=[...board,c]; setBoard(next); if(next.length>=limit) setShowPicker(false); }
+      function nextStreet(){ setStage(s=>{ const ns=nextStageOf(s); setShowPicker(true); setBadRivers(null); setGoodRivers(null); setRiverComb(null); return ns; }); }
+
+      async function calcRivers(kind){
+        const deck=removeCards(makeDeck(),[...hero,...board]);
+        const itersPer = mode==="fast"?200:600;
+        const pairs=[]; // {card, eq}
+        for(const c of deck){ const {equity:eq}=simEquity({game,hero,board:[...board,c],opponents,iters:itersPer,posKey}); pairs.push({card:c, eq}); }
+        if(kind==='bad'){
+          const list = pairs.filter(x=>x.eq<0.5).sort((a,b)=>a.eq-b.eq); // худшие в начале
+          setBadRivers(list); setGoodRivers(null);
+        } else {
+          const list = pairs.filter(x=>x.eq>=0.5).sort((a,b)=>b.eq-a.eq); // лучшие в начале
+          setGoodRivers(list); setBadRivers(null);
+        }
+      }
+      const calcBadRivers = ()=> calcRivers('bad');
+      const calcGoodRivers = ()=> calcRivers('good');
+
+      async function calcCombVsRangeOnRiver(){ const res=analyzeVsRangeAtRiver({game,hero,board,opponents,iters:mode==="fast"?1200:3000,posKey}); setRiverComb(res); }
+
+      const equityPct = equityData ? (equityData.equity*100).toFixed(1)+"%" : "—";
+      const riverProb = (stage==="turn" && board.length===4) ? riverProbPercent(hero,board).toFixed(2)+"%" : null;
+
+      if(view==="home"){
+        return React.createElement("div",{className:"w-full min-h-screen p-4"},
+          React.createElement("div",{className:"max-w-sm mx-auto mt-10 space-y-4 text-center"},
+            React.createElement("h1",{className:"text-2xl font-bold"},"Выберите покер"),
+            React.createElement("div",{className:"grid grid-cols-1 gap-3"},
+              React.createElement("button",{className:"p-4 rounded-xl border border-slate-700 bg-slate-900 shadow text-lg",onClick:()=>{setGame("holdem"); resetHand(); setView("table");}},"Холдем (2)"),
+              React.createElement("button",{className:"p-4 rounded-xl border border-slate-700 bg-slate-900 shadow text-lg",onClick:()=>{setGame("omaha"); resetHand(); setView("table");}},"Омаха (4)")
+            )
+          )
+        );
+      }
+
+      return React.createElement("div",{className:"w-full min-h-screen p-2"},
+        React.createElement("div",{className:"space-y-3 max-w-sm mx-auto"},
+          React.createElement("div",{className:"flex items-center justify-between"},
+            React.createElement("div",{className:"text-xs text-slate-300"},"Игра: ",game==="holdem"?"Холдем":"Омаха"),
+            React.createElement("div",{className:"flex items-center gap-2"},
+              React.createElement("button",{className:"text-xs underline",onClick:()=>setView("home")},"← Тип игры"),
+              React.createElement("button",{className:"text-xs underline",onClick:resetHand},"Новая раздача")
+            )
+          ),
+
+          React.createElement("div",{className:"bg-slate-900 rounded-lg shadow p-2 grid grid-cols-2 gap-2 text-xs border border-slate-700"},
+            React.createElement("div",{className:"flex items-center gap-2"},
+              React.createElement("span",null,"Оппонентов"),
+              React.createElement("select",{className:"border border-slate-700 rounded px-2 py-1 bg-slate-800",value:opponents,onChange:e=>setOpponents(Math.max(1,Math.min(9,Number(e.target.value))))}, ...Array.from({length:9},(_,i)=>i+1).map(n=>React.createElement("option",{key:n,value:n},n)))
+            ),
+            React.createElement("div",{className:"flex items-center gap-2"},
+              React.createElement("span",null,"Режим"),
+              React.createElement("div",{className:"flex gap-1"},
+                React.createElement("button",{className:"px-2 py-1 rounded border border-slate-700 "+(mode==="fast"?"bg-emerald-700 text-white":"bg-slate-900"),onClick:()=>setMode("fast")},"Быстро"),
+                React.createElement("button",{className:"px-2 py-1 rounded border border-slate-700 "+(mode==="accurate"?"bg-emerald-700 text-white":"bg-slate-900"),onClick:()=>setMode("accurate")},"Точно")
+              )
+            ),
+            React.createElement("div",{className:"flex items-center gap-2 col-span-2"},
+              React.createElement("span",null,"Позиция"),
+              React.createElement("select",{className:"border border-slate-700 rounded px-2 py-1 bg-slate-800",value:posKey,onChange:e=>setPosKey(e.target.value)}, ...POSITIONS.map(p=>React.createElement("option",{key:p.key,value:p.key},p.label)))
+            )
+          ),
+
+          (hero.length>0)&&React.createElement(GridCards,{title:"Ваши карманные",cards:hero}),
+          (board.length>0)&&React.createElement(GridCards,{title:"Борд",cards:board}),
+
+          (stage!=="preflop")&&React.createElement("div",{className:"bg-slate-900 rounded-lg shadow p-2 space-y-1 text-center border border-slate-700"},
+            React.createElement(Pill,null,"Комбинация: ",bestNow?handTypeNameRu(bestNow):"—"),
+            React.createElement(Pill,null,"Эквити: ",equityPct),
+            (stage!=="river")&&React.createElement(Pill,null,"Ауты: ",outsNow.outs," (",(outsNow.pct*100).toFixed(1),"%)"),
+            React.createElement("div",{className:"grid grid-cols-2 gap-1 text-xs mt-1"},
+              ...HAND_ORDER.map(k=>{
+                const outsK = (outsByType.map?.[k]||0);
+                return React.createElement("div",{key:k,className:"flex items-center justify-between border border-slate-700 rounded px-2 py-1 bg-slate-800"},
+                  React.createElement("span",null,k),
+                  React.createElement("div",{className:"text-right"},
+                    React.createElement("div",{className:"font-semibold"}, equityData?((equityData.probs[k]*100).toFixed(1)+"%"):"—"),
+                    React.createElement("div",{className:"text-[11px] text-slate-400"},"ауты: ", outsK)
+                  )
+                );
+              })
+            )
+          ),
+
+          (showPicker && hero.length<needHero) && React.createElement(CardPicker,{title:`Карманные карты (${hero.length}/${needHero})`,disabled:false,taken:[...hero,...board],currentCount:hero.length,limit:needHero,onPick:onPickHero}),
+
+          (showPicker && stage!=="preflop" && hero.length>=needHero) && React.createElement(CardPicker,{title: stage==="flop"?"Выберите флоп (3 карты)": stage==="turn"?"Выберите тёрн (1 карта)": stage==="river"?"Выберите ривер (1 карта)":"Борд выбран", disabled:(stage==="flop"&&board.length>=3)||(stage==="turn"&&board.length>=4)||(stage==="river"&&board.length>=5), taken:[...hero,...board], currentCount:board.length, limit: stage==="flop"?3:stage==="turn"?4:stage==="river"?5:0, onPick:onPickBoard}),
+
+          React.createElement("div",{className:"flex flex-wrap gap-2 justify-center"},
+            React.createElement("button",{className:"px-3 py-1 rounded border border-slate-700 text-xs bg-slate-900",onClick:resetHand},"Fold"),
+            (stage==="preflop" && hero.length>=needHero && !showPicker) && React.createElement("button",{className:"px-3 py-1 rounded border border-slate-700 bg-emerald-700 text-white text-xs",onClick:nextStreet},"Флоп"),
+            (stage==="flop" && board.length>=3 && !showPicker) && React.createElement("button",{className:"px-3 py-1 rounded border border-slate-700 bg-emerald-700 text-white text-xs",onClick:nextStreet},"Тёрн"),
+            (stage==="turn" && board.length>=4 && !showPicker) && React.createElement("button",{className:"px-3 py-1 rounded border border-slate-700 bg-emerald-700 text-white text-xs",onClick:nextStreet},"Ривер"),
+            (stage==="turn" && board.length>=4 && !showPicker) && React.createElement("button",{className:"px-3 py-1 rounded border border-slate-700 bg-rose-700 text-white text-xs",onClick:()=>calcBadRivers()}, "Плохие риверы"),
+            (stage==="turn" && board.length>=4 && !showPicker) && React.createElement("button",{className:"px-3 py-1 rounded border border-slate-700 bg-emerald-800 text-white text-xs",onClick:()=>calcGoodRivers()}, "Хорошие риверы")
+          ),
+
+          ((badRivers||goodRivers) && stage==="turn") && React.createElement("div",{className:"bg-slate-900 rounded-lg shadow p-2 border border-slate-700"},
+            React.createElement("div",{className:"text-xs text-slate-300 mb-2"}, badRivers?"Риверы, где наше эквити < 50%":"Риверы, где наше эквити ≥ 50%"),
+            riverProb && React.createElement("div",{className:"text-[11px] text-slate-400 mb-2"},"Вероятность любой конкретной карты ривера: ",riverProb),
+            React.createElement("div",{className:"grid grid-cols-6 gap-2"},
+              ...((badRivers||goodRivers)||[]).map((x,idx)=>{
+                const isTop = idx < 5;
+                const cls = (badRivers?"bg-rose-900/30":"bg-emerald-900/30") + (isTop?" ring-2 "+(badRivers?"ring-rose-400":"ring-emerald-400"):"");
+                return React.createElement("div",{key:x.card,className:"text-center"},
+                  React.createElement("div",{className:"px-2 py-1 rounded border border-slate-700 "+cls}, cardLabel(x.card)),
+                  React.createElement("div",{className:"text-[10px] text-slate-400 mt-0.5"}, (x.eq*100).toFixed(1),"%")
+                );
+              })
+            )
+          ),
+
+          (!showPicker && stage==="river" && board.length===5) && React.createElement("div",{className:"bg-slate-900 rounded-lg shadow p-2 space-y-2 border border-slate-700"},
+            React.createElement("div",{className:"flex flex-wrap gap-2 justify-center"},
+              React.createElement("button",{className:"px-3 py-1 rounded border border-slate-700 text-xs",onClick:calcCombVsRangeOnRiver},"Проанализировать ривер"),
+              riverComb && React.createElement("span",{className:"text-[11px] text-slate-400"},"Сэмплов: ",riverComb.total)
+            ),
+            riverComb && React.createElement("div",{className:"grid grid-cols-1 gap-2"},
+              React.createElement("div",{className:"border border-slate-700 rounded p-2"},
+                React.createElement("div",{className:"text-xs font-medium mb-1 text-rose-400"},"Комбинации оппов, которым мы проигрываем"),
+                ...Object.entries(riverComb.lose).sort((a,b)=>b[1]-a[1]).map(([k,v])=> React.createElement("div",{key:k,className:"text-xs flex justify-between"}, React.createElement("span",null,k), React.createElement("span",{className:"font-semibold"},((v/riverComb.total)*100).toFixed(1),"%")))
+              ),
+              React.createElement("div",{className:"border border-slate-700 rounded p-2"},
+                React.createElement("div",{className:"text-xs font-medium mb-1 text-emerald-400"},"Комбинации оппов, которые мы выигрываем"),
+                ...Object.entries(riverComb.win).sort((a,b)=>b[1]-a[1]).map(([k,v])=> React.createElement("div",{key:k,className:"text-xs flex justify-between"}, React.createElement("span",null,k), React.createElement("span",{className:"font-semibold"},((v/riverComb.total)*100).toFixed(1),"%")))
+              )
+            )
+          )
+        )
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(React.createElement(App));
+  </script>
+</body>
+</html>
